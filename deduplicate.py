@@ -205,8 +205,7 @@ class SemDeDup:
         return (i, img_emb_indices, remaining_proportion, cluster_size)
 
       # Process clusters in parallel.
-      with ThreadPoolExecutor(max_workers=8) as executor:
-        print("spawning threads...")
+      with ThreadPoolExecutor(max_workers=self.cluster_process_thread_count) as executor:
         futures = [executor.submit(process_cluster, i) for i in range(self.num_clusters)]
 
         with tqdm(total=len(futures)) as pbar:
@@ -270,7 +269,7 @@ def deduplicate(
   target_cluster_size: int = 7500,
   num_clusters: int = 100,
   epsilon: float = 0.325,
-  cluster_process_thread_count: int = 12,
+  cluster_process_thread_count: int = 8,
   log_clusters: bool = True,
   log_clusters_n: int = 5,
   download_images: bool = True,
