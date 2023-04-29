@@ -15,28 +15,8 @@ from tqdm import tqdm
 import fire
 from img2dataset import download
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-def save_image_grid(images, grid_size = (4,4), grid_path="./grid.jpg"):
-  try:
-    dirs, _ = os.path.split(grid_path)
-    # Create the directories if they don't exist
-    if dirs:
-        os.makedirs(dirs, exist_ok=True)
-
-    # Create image grid
-    fig, axes = plt.subplots(grid_size[0], grid_size[1], figsize=(10, 10))
-    for i in range(grid_size[0]):
-        for j in range(grid_size[1]):
-            idx = i * grid_size[0] + j
-            if idx < len(images):
-                axes[i, j].imshow(images[idx])
-                axes[i, j].axis('off')
-    plt.tight_layout()
-
-    fig.savefig(grid_path, bbox_inches='tight')
-    plt.close(fig)
-  except Exception as e:
-    pass
+from utils import save_image_grid
+import gc
 
 script_path = os.path.dirname(os.path.realpath(__file__))
 
@@ -88,7 +68,6 @@ class SemDeDup:
           return table
 
       metadata_paths = sorted([p for p in os.listdir(metadata_dir) if p.endswith(".parquet")])
-      metadata_paths = metadata_paths[:3]
       
       print(f"Reading {len(metadata_paths)} metadata files...")
 
@@ -110,7 +89,6 @@ class SemDeDup:
           return np_array
 
       img_emb_paths = sorted([p for p in os.listdir(img_emb_dir) if p.endswith(".npy")])
-      img_emb_paths = img_emb_paths[:3]
 
       print(f"Reading {len(img_emb_paths)} embedding files...")
 
@@ -120,30 +98,38 @@ class SemDeDup:
       img_emb = np.concatenate(np_arrays)
       return img_emb
 
-    def create_index(self, embeddings, gpu_index=False):
+    def create_index(self, embeddings):
       """ Creates a faiss index of embeddings.
       
       Args:
         embeddings: numpy array of embeddings
-        gpu_index: whether to create a gpu index
         
       Returns:
         index: faiss index of embeddings
       """
       index = faiss.IndexFlatIP(embeddings.shape[1])
+      index.add(embeddings)
+      return index
 
-      if gpu_index:
-          res = faiss.StandardGpuResources()
-          gpu_index = faiss.index_cpu_to_gpu(res, 0, index)
-          gpu_index.add(embeddings)
-          return gpu_index
-      else:
-          index.add(embeddings)
-          return index
+    def unbiased_sampling(self, embeddings, num_samples):
+      num_embeddings = embeddings.shape[0]
+      random_state = np.random.RandomState(123)
+      indices = random_state.choice(num_embeddings, size=num_samples, replace=False)
+      sampled_embeddings = embeddings[indices]
 
+      return sampled_embeddings
+  
     def train_kmeans(self, embeddings):
-      kmeans = faiss.Kmeans(embeddings.shape[1], self.num_clusters, gpu=True, niter=20, verbose=True)
-      kmeans.train(embeddings)
+      
+      max_training_points = 500000 # Protect against memory running out.
+      kmeans = faiss.Kmeans(embeddings.shape[1], self.num_clusters, niter=20, verbose=True)
+            
+      if embeddings.shape[0] > max_training_points:
+        sampled_embeddings = self.unbiased_sampling(embeddings, 500000)
+        kmeans.train(sampled_embeddings)
+      else:
+        kmeans.train(embeddings)
+      
       return kmeans
       
     def filter_cluster(self, cluster, cluster_index, epsilon):
@@ -181,7 +167,9 @@ class SemDeDup:
       return keep_indices
 
     def deduplicate(self):
+      print("Starting deduplication...")
       kmeans_cluster = self.train_kmeans(self.img_emb)
+
       D, cluster_labels = kmeans_cluster.assign(self.img_emb)
 
       embeddings_to_keep = np.zeros(self.img_emb.shape[0], dtype=bool)
@@ -217,7 +205,8 @@ class SemDeDup:
         return (i, img_emb_indices, remaining_proportion, cluster_size)
 
       # Process clusters in parallel.
-      with ThreadPoolExecutor() as executor:
+      with ThreadPoolExecutor(max_workers=8) as executor:
+        print("spawning threads...")
         futures = [executor.submit(process_cluster, i) for i in range(self.num_clusters)]
 
         with tqdm(total=len(futures)) as pbar:
@@ -225,6 +214,8 @@ class SemDeDup:
             try:
               i, img_emb_indices, remaining_proportion, cluster_size = future.result()
               embeddings_to_keep[img_emb_indices] = True
+              del img_emb_indices
+              gc.collect()
               tqdm.write(f"Processed cluster {i}: Keeping {remaining_proportion * 100:.2f}% of original size {cluster_size}")
               pbar.update(1)
             except Exception as e:
